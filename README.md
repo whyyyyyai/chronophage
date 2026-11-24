@@ -34,7 +34,10 @@ every agent is offline.
 - Delete, edit or reroute a note.
 - Type into a window itself. Waking goes through `comms-deck wake`, which
   keeps all of comms-deck's checks: no typing over a draft, no typing into a
-  focused window, and the loop guard.
+  focused window, and the loop guard. A wake pastes the notes and presses
+  Enter, so `--stale` waits until a seat has shown no change for 10 minutes.
+- Run before comms-deck has `status --json`: leave the timer off until then,
+  or every pass reports that the status command failed.
 - Wake an agent that is out of usage, or one the owner has paused.
 
 ## Install

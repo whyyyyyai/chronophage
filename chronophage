@@ -147,15 +147,19 @@ def report(problems, state, dry, now):
         if dry:
             log(f"would tell the owner{again}: {text}")
             continue
-        deck("--from", "chronophage", "send", "owner", f"Chronophage{again}: {text}")
+        code, out = deck("--from", "chronophage", "send", "owner", f"Chronophage{again}: {text}")
+        if code != 0:
+            log(f"couldn't tell the owner ({out[:120]}); will try again next pass: {text}")
+            continue  # not marked as told, so the next pass retries instead of staying quiet for an hour
         known[key] = {"since": entry["since"] if entry else now, "told": now, "text": text}
         log(f"told the owner{again}: {text}")
     for key in [k for k in known if k not in problems]:
         if not dry:
-            deck("--from", "chronophage", "send", "owner", "--quiet",
-                 f"Chronophage: cleared: {known[key]['text']}")
-            log(f"cleared: {key}")
-            del known[key]
+            code, _ = deck("--from", "chronophage", "send", "owner", "--quiet",
+                           f"Chronophage: cleared: {known[key]['text']}")
+            if code == 0:
+                log(f"cleared: {key}")
+                del known[key]
 
 
 def one_pass(dry=False):
