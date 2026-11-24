@@ -1,0 +1,11 @@
+# chronophage: one watchdog pass over comms-deck. Started by chronophage.timer.
+# Written by: Claude (2026-11-24)
+[Unit]
+Description=chronophage: no-AI watchdog for comms-deck (one pass)
+After=comms-deck.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/chronophage/chronophage
+Environment=PYTHONUNBUFFERED=1
+TimeoutStartSec=120

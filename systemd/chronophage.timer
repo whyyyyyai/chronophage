@@ -1,0 +1,15 @@
+# chronophage.timer: run the watchdog a minute after login, then every minute.
+#   ln -s ~/chronophage/systemd/chronophage.{service,timer} ~/.config/systemd/user/
+#   systemctl --user enable --now chronophage.timer
+# Written by: Claude (2026-11-24)
+[Unit]
+Description=chronophage: run the comms-deck watchdog every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

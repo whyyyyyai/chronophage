@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""chronophage: the no-AI watchdog for comms-deck.
+
+Run once a minute by chronophage.timer. Each pass:
+
+  1. Services. comms-deck.service and push-courier.service must be active.
+     A dead one is restarted. One that stays dead is reported to the owner.
+  2. Agents. Reads `comms-deck status --json`, then for each seat:
+       - busy with no change for 10 min while notes wait (its Stop never
+         ran): `comms-deck wake <seat> --stale` delivers them.
+       - ready but notes have waited 5 min: `comms-deck wake <seat>`.
+       - anything it can't fix (a draft in the prompt, the loop guard,
+         an app whose sends keep failing, an agent that isn't running while
+         notes pile up) is reported to the owner.
+     An agent that is out of usage (spent) is left alone: its notes wait.
+  3. Reports. A problem is told to the owner once, as a note on the chat
+     screen, then again at most once an hour while it lasts. When it clears,
+     one short note says so.
+  4. Writes ~/.local/state/chronophage/status.json: what it saw and did.
+
+It never runs a model, never deletes a note, never types anything itself
+(waking goes through comms-deck, which has its own checks), and never
+touches a seat the owner has paused (codex) or hidden.
+
+    chronophage              one pass (what the timer runs)
+    chronophage --dry-run    one pass that only says what it would do
+    chronophage --self-test  test the decisions against a fake comms-deck
+
+Written by: Claude (2026-11-24), at the owner's request.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+COMMS_DECK = os.environ.get("CHRONOPHAGE_COMMS_DECK", str(HOME / ".local/bin/comms-deck"))
+STATE_DIR = Path(os.environ.get("CHRONOPHAGE_STATE", HOME / ".local/state/chronophage"))
+SERVICES = ("comms-deck.service", "push-courier.service")
+LEAVE_ALONE = {"codex"}   # paused by the owner: watched, never woken or reported
+
+STALE_BUSY_S = 600        # busy, file unchanged, notes waiting: Stop never ran
+STUCK_S = 300             # ready with notes waiting this long: wake it
+AWAY_REPORT_S = 1800      # not running while normal notes wait this long: tell the owner
+DRAFT_REPORT_S = 900      # a draft holding notes back this long: tell the owner
+REMIND_S = 3600           # repeat a report at most this often
+
+
+def log(text):
+    print(time.strftime("%H:%M:%S"), text, flush=True)
+
+
+def run(cmd, timeout=60):
+    """(exit code, stdout) of a command; never raises."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        return 127, str(error)
+
+
+def deck(*args, timeout=60):
+    return run([sys.executable, COMMS_DECK, *args] if COMMS_DECK.endswith(".py") else [COMMS_DECK, *args],
+               timeout=timeout)
+
+
+def load_state():
+    try:
+        return json.loads((STATE_DIR / "state.json").read_text())
+    except (OSError, ValueError):
+        return {"problems": {}}
+
+
+def save_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_DIR / "state.json.tmp"
+    tmp.write_text(json.dumps(state, indent=1))
+    tmp.replace(STATE_DIR / "state.json")
+
+
+def check_services(dry):
+    """Restart dead services. Returns problems: {key: text}."""
+    problems = {}
+    for unit in SERVICES:
+        code, _ = run(["systemctl", "--user", "is-active", "--quiet", unit])
+        if code == 0:
+            continue
+        if dry:
+            log(f"would restart {unit}")
+            continue
+        log(f"{unit} is not active: restarting")
+        run(["systemctl", "--user", "restart", unit])
+        time.sleep(2)
+        if run(["systemctl", "--user", "is-active", "--quiet", unit])[0] != 0:
+            problems[f"service:{unit}"] = f"{unit} is down and didn't restart. journalctl --user -u {unit} says why."
+    return problems
+
+
+def plan(seats):
+    """Decide, from `status --json` seats, what to wake and what to report.
+
+    Returns (wakes [(seat, stale)], problems {key: text}). Pure, so it is tested.
+    """
+    wakes, problems = [], {}
+    for seat, s in seats.items():
+        if s.get("hidden") or seat in LEAVE_ALONE:
+            continue
+        if s.get("spent_until"):
+            continue  # out of usage: its notes wait for the reset
+        waiting, oldest = s.get("waiting_normal", 0), s.get("oldest_waiting_s", 0)
+        if not waiting:
+            continue
+        if s.get("kind") == "agent":
+            if s.get("paused"):
+                problems[f"paused:{seat}"] = f"{seat.title()} is paused by the loop guard with {waiting} note(s) waiting. A note from the owner resumes it."
+            elif s.get("held_by_draft") and oldest >= DRAFT_REPORT_S:
+                problems[f"draft:{seat}"] = f"{seat.title()} has unsent text in its prompt, holding {waiting} note(s) back."
+            elif s.get("state") == "busy" and s.get("file_age_s", 0) >= STALE_BUSY_S and oldest >= STALE_BUSY_S:
+                wakes.append((seat, True))
+            elif s.get("state") == "idle" and oldest >= STUCK_S:
+                wakes.append((seat, False))
+            elif s.get("state") == "away" and oldest >= AWAY_REPORT_S:
+                problems[f"away:{seat}"] = f"{seat.title()} isn't running and {waiting} note(s) have waited {oldest // 60} min. Start it in its kitty."
+        else:  # an app seat: the deck types into it, or it polls
+            if s.get("retry_at") and oldest >= STUCK_S:
+                problems[f"sending:{seat}"] = f"Notes to {seat.title()} keep failing to send; {waiting} waiting. The service log says why."
+            elif s.get("held_by_draft") and oldest >= DRAFT_REPORT_S:
+                problems[f"draft:{seat}"] = f"{seat.title()}'s chat box has unsent text holding {waiting} note(s) back."
+            elif s.get("state") in ("not connected", "chat not open", "not set up", "away") and oldest >= AWAY_REPORT_S:
+                problems[f"away:{seat}"] = f"{seat.title()} is {s.get('state')} and {waiting} note(s) have waited {oldest // 60} min."
+            elif oldest >= AWAY_REPORT_S:
+                problems[f"unread:{seat}"] = (f"{seat.title()} hasn't picked up {waiting} note(s) in {oldest // 60} min. "
+                                              f"If it only checks when asked (Lumo), ask it in its window to read its notes.")
+    return wakes, problems
+
+
+def report(problems, state, dry, now):
+    """Tell the owner about new problems, remind hourly, and say when one clears."""
+    known = state.setdefault("problems", {})
+    for key, text in problems.items():
+        entry = known.get(key)
+        if entry and now - entry["told"] < REMIND_S:
+            continue
+        again = " (still)" if entry else ""
+        if dry:
+            log(f"would tell the owner{again}: {text}")
+            continue
+        deck("--from", "chronophage", "send", "owner", f"Chronophage{again}: {text}")
+        known[key] = {"since": entry["since"] if entry else now, "told": now, "text": text}
+        log(f"told the owner{again}: {text}")
+    for key in [k for k in known if k not in problems]:
+        if not dry:
+            deck("--from", "chronophage", "send", "owner", "--quiet",
+                 f"Chronophage: cleared: {known[key]['text']}")
+            log(f"cleared: {key}")
+            del known[key]
+
+
+def one_pass(dry=False):
+    now = time.time()
+    state = load_state()
+    problems = check_services(dry)
+    code, out = deck("status", "--json")
+    seats = {}
+    if code == 0:
+        try:
+            seats = json.loads(out)["seats"]
+        except (ValueError, KeyError):
+            problems["status"] = "comms-deck status --json returned something unreadable."
+    else:
+        problems["status"] = f"comms-deck status --json failed: {out[:200]}"
+    wakes, seat_problems = plan(seats)
+    problems.update(seat_problems)
+    woken = []
+    for seat, stale in wakes:
+        if dry:
+            log(f"would wake {seat}" + (" (stale busy)" if stale else ""))
+            continue
+        code, out = deck("wake", seat, *(["--stale"] if stale else []))
+        try:
+            result = json.loads(out)
+        except ValueError:
+            result = {"woken": False, "reason": out[:120]}
+        log(f"wake {seat}: {result.get('reason')}")
+        if result.get("woken"):
+            woken.append(seat)
+        elif result.get("reason") not in ("nothing waiting",):
+            problems[f"wake:{seat}"] = f"{seat.title()} has notes it can't be given: {result.get('reason')}."
+    report(problems, state, dry, now)
+    if not dry:
+        save_state(state)
+        (STATE_DIR / "status.json").write_text(json.dumps({
+            "time": now, "woken": woken, "problems": problems,
+            "seats": {k: {f: v.get(f) for f in ("state", "shown", "waiting")} for k, v in seats.items()},
+        }, indent=1))
+    return woken, problems
+
+
+def self_test():
+    """Test plan() against made-up seats. No commands run."""
+    base = {"kind": "agent", "waiting_normal": 2, "oldest_waiting_s": 700, "file_age_s": 700}
+    seats = {
+        "a": {**base, "state": "busy"},                              # stale busy
+        "b": {**base, "state": "idle"},                              # stuck ready
+        "c": {**base, "state": "idle", "spent_until": 1e12},         # spent: leave
+        "d": {**base, "state": "idle", "paused": True},              # report paused
+        "e": {**base, "state": "busy", "file_age_s": 30},            # really busy
+        "codex": {**base, "state": "idle"},                          # owner's pause
+        "f": {**base, "state": "away", "oldest_waiting_s": 4000},    # not running
+        "g": {**base, "kind": "app", "state": "idle", "retry_at": 1.0},
+        "h": {**base, "state": "idle", "hidden": True},
+        "i": {**base, "state": "idle", "waiting_normal": 0},
+        "lumo": {**base, "kind": "app", "state": "idle", "oldest_waiting_s": 2000},
+    }
+    wakes, problems = plan(seats)
+    checks = [
+        ("stale busy is woken with --stale", ("a", True) in wakes),
+        ("a stuck ready seat is woken", ("b", False) in wakes),
+        ("a spent seat is left alone", not any(s == "c" for s, _ in wakes) and not any(":c" in k for k in problems)),
+        ("the loop guard is reported, not woken", "paused:d" in problems and not any(s == "d" for s, _ in wakes)),
+        ("a truly busy seat is left alone", not any(s == "e" for s, _ in wakes)),
+        ("codex is never touched", not any(s == "codex" for s, _ in wakes) and not any("codex" in k for k in problems)),
+        ("an agent that isn't running is reported", "away:f" in problems),
+        ("an app whose sends fail is reported", "sending:g" in problems),
+        ("an app seat that hasn't checked for 30 min is reported", "unread:lumo" in problems),
+        ("hidden and empty seats are skipped", not any(s in ("h", "i") for s, _ in wakes)),
+    ]
+    for name, ok in checks:
+        print(("ok   " if ok else "FAIL ") + name)
+    failed = sum(1 for _, ok in checks if not ok)
+    print("\n" + ("all passed" if not failed else f"{failed} failed"))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(self_test())
+    one_pass(dry="--dry-run" in sys.argv)
