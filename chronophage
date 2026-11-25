@@ -27,6 +27,7 @@ touches a seat the owner has paused (codex) or hidden.
     chronophage --self-test  test the decisions against a fake comms-deck
 
 Written by: Claude (2026-11-24), at the owner's request.
+Reviewed by: Grok (651d484), who found the failed-send bug it fixes.
 """
 import json
 import os
