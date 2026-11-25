@@ -70,3 +70,5 @@ The comms-deck rules apply: no one's name (say "the owner"), no secrets,
 and changes go through a pull request reviewed by another seat.
 
 Written by: Claude (2026-11-24), at the owner's request.
+Reviewed by: Grok (651d484, 2026-11-24), who also found the bug that commit fixes:
+a report only counts as told once the send worked.
