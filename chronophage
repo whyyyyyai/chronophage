@@ -134,6 +134,28 @@ def has_hooks(seat):
     return False
 
 
+def settle(dry):
+    """Match each screen-read seat's busy/idle to its window, both ways
+    (`comms-deck settle`): busy with an idle prompt on screen becomes idle,
+    so its notes are delivered; idle with a turn running becomes busy, so no
+    note is pasted into it. Y, 23:49 on 27 Nov: "there should be scripts and
+    programs in the chronophage that automate these kind of triggers (and
+    their inverse)", rather than an agent fixing seat states by hand.
+    Returns the changes. A deck too old to have `settle` is skipped."""
+    if dry:
+        return []
+    code, out = deck("settle")
+    if code != 0:
+        return []  # older comms-deck without the command: nothing to do
+    try:
+        changed = json.loads(out.splitlines()[-1]).get("changed", [])
+    except (ValueError, IndexError, AttributeError):
+        return []
+    for c in changed:
+        log(f"settled {c['seat']}: {c['from']} -> {c['to']} (from its screen)")
+    return changed
+
+
 def plan(seats, hooks=None):
     """Decide, from `status --json` seats, what to wake and what to report.
     `hooks` is {seat: has_hooks(seat)}; missing means unknown.
@@ -259,6 +281,7 @@ def one_pass(dry=False):
     now = time.time()
     state = load_state()
     problems = check_services(dry)
+    settled = settle(dry)
     code, out = deck("status", "--json")
     seats = {}
     if code == 0:
@@ -290,10 +313,24 @@ def one_pass(dry=False):
     if not dry:
         save_state(state)
         (STATE_DIR / "status.json").write_text(json.dumps({
-            "time": now, "woken": woken, "problems": problems,
+            "time": now, "woken": woken, "settled": settled, "problems": problems,
             "seats": {k: {f: v.get(f) for f in ("state", "shown", "waiting")} for k, v in seats.items()},
         }, indent=1))
     return woken, problems
+
+
+def settle_check():
+    """settle() against a fake deck: parses the changes, tolerates an old deck."""
+    global deck
+    real = deck
+    try:
+        deck = lambda *a, **k: (0, 'log line\n{"screen_turns": ["codex"], "changed": [{"seat": "codex", "from": "busy", "to": "idle"}]}')
+        ok = settle(False) == [{"seat": "codex", "from": "busy", "to": "idle"}]
+        deck = lambda *a, **k: (2, "invalid choice: 'settle'")
+        ok = ok and settle(False) == [] and settle(True) == []
+        return ok
+    finally:
+        deck = real
 
 
 def self_test():
@@ -335,6 +372,7 @@ def self_test():
             {"number": 4, "title": "comment", "createdAt": "2026-01-01T00:00:00Z", "comments": [{"body": "ok\nReviewed by: Devin"}]},
             {"number": 5, "title": "draft", "createdAt": "2026-01-01T00:00:00Z", "isDraft": True},
         ], time.time())] == [1]),
+        ("settle reads the deck's answer and skips an old deck", settle_check()),
         ("a LEAVE_ALONE seat is never touched", not any(s == "z" for s, _ in wakes) and not any(":z" in k for k in problems)),
         ("an agent that isn't running is reported", "away:f" in problems),
         ("an app whose sends fail is reported", "sending:g" in problems),
