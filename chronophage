@@ -202,8 +202,9 @@ def unreviewed(prs, now):
 
 def list_unreviewed(state, dry, now):
     """Once a day, tell Y which PRs have waited 6 h+ with no review."""
-    if now - state.get("prs_listed", 0) < PR_LIST_EVERY_S:
+    if now - state.get("prs_listed", 0) < PR_LIST_EVERY_S or now - state.get("prs_tried", 0) < 3600:
         return
+    state["prs_tried"] = now  # a failing gh (offline, logged out) is retried hourly, not every pass
     lines = []
     for repo in PR_REPOS:
         code, out = run(["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
