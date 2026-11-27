@@ -44,6 +44,18 @@ SERVICES = ("comms-deck.service", "push-courier.service")
 # here until Y brought it back (2026-11-27). Comma-separated seat names.
 LEAVE_ALONE = {s.strip() for s in os.environ.get("CHRONOPHAGE_LEAVE_ALONE", "").split(",") if s.strip()}
 
+# Where each agent's comms-deck hooks live. An agent with none never tells
+# the deck its turn ended, so it freezes at "busy" and its notes queue up:
+# Codex, 22:32-22:58 on 27 Nov (its hooks PR sat unmerged). Any of the
+# files holding "comms-deck hook" counts.
+HOOK_FILES = {
+    "claude": [".claude/settings.json"],
+    "grok": [".grok/hooks/comms-deck.json"],
+    "codex": [".codex/hooks.json"],
+    "devin": [".config/devin/config.json"],
+    "vibe": [".vibe/hooks.toml"],
+}
+
 STALE_BUSY_S = 600        # busy, file unchanged, notes waiting: Stop never ran
 STUCK_S = 300             # ready with notes waiting this long: wake it
 AWAY_REPORT_S = 1800      # not running while normal notes wait this long: tell the owner
@@ -101,15 +113,37 @@ def check_services(dry):
     return problems
 
 
-def plan(seats):
+def has_hooks(seat):
+    """True if one of the seat's hook files has comms-deck hooks; None if we don't know where they live."""
+    files = HOOK_FILES.get(seat)
+    if not files:
+        return None
+    for rel in files:
+        try:
+            if "comms-deck hook" in (HOME / rel).read_text():
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def plan(seats, hooks=None):
     """Decide, from `status --json` seats, what to wake and what to report.
+    `hooks` is {seat: has_hooks(seat)}; missing means unknown.
 
     Returns (wakes [(seat, stale)], problems {key: text}). Pure, so it is tested.
     """
     wakes, problems = [], {}
+    hooks = hooks or {}
     for seat, s in seats.items():
         if s.get("hidden") or seat in LEAVE_ALONE:
             continue
+        # Checked whether or not notes wait: missing hooks are the cause, a
+        # stuck queue only the symptom.
+        if s.get("kind") == "agent" and s.get("state") != "away" and hooks.get(seat) is False:
+            problems[f"hooks:{seat}"] = (f"{seat.title()} is running with no comms-deck hooks installed, so the deck "
+                                         f"never sees its turns end and its notes will queue. Run `comms-deck install`; "
+                                         f"for Codex, then trust them with /hooks inside Codex.")
         if s.get("spent_until"):
             continue  # out of usage: its notes wait for the reset
         waiting, oldest = s.get("waiting_normal", 0), s.get("oldest_waiting_s", 0)
@@ -178,7 +212,7 @@ def one_pass(dry=False):
             problems["status"] = "comms-deck status --json returned something unreadable."
     else:
         problems["status"] = f"comms-deck status --json failed: {out[:200]}"
-    wakes, seat_problems = plan(seats)
+    wakes, seat_problems = plan(seats, {seat: has_hooks(seat) for seat in seats})
     problems.update(seat_problems)
     woken = []
     for seat, stale in wakes:
@@ -222,8 +256,10 @@ def self_test():
         "i": {**base, "state": "idle", "waiting_normal": 0},
         "lumo": {**base, "kind": "app", "state": "idle", "oldest_waiting_s": 2000},
     }
+    seats["n"] = {**base, "state": "idle", "waiting_normal": 0}          # no hooks
+    seats["m"] = {**base, "state": "away", "waiting_normal": 0}          # no hooks, not running
     LEAVE_ALONE.add("z")
-    wakes, problems = plan(seats)
+    wakes, problems = plan(seats, {"n": False, "m": False, "a": True, "z": False})
     LEAVE_ALONE.discard("z")
     checks = [
         ("stale busy is woken with --stale", ("a", True) in wakes),
@@ -232,6 +268,9 @@ def self_test():
         ("the loop guard is reported, not woken", "paused:d" in problems and not any(s == "d" for s, _ in wakes)),
         ("a truly busy seat is left alone", not any(s == "e" for s, _ in wakes)),
         ("a stuck codex is woken like any seat", ("codex", False) in wakes),
+        ("a running agent with no hooks is reported", "hooks:n" in problems),
+        ("an agent that isn't running isn't nagged about hooks", "hooks:m" not in problems),
+        ("unknown hook files aren't reported", not any(k == "hooks:b" for k in problems)),
         ("a LEAVE_ALONE seat is never touched", not any(s == "z" for s, _ in wakes) and not any(":z" in k for k in problems)),
         ("an agent that isn't running is reported", "away:f" in problems),
         ("an app whose sends fail is reported", "sending:g" in problems),
