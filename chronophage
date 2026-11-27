@@ -29,6 +29,7 @@ touches a seat the owner has hidden or listed in CHRONOPHAGE_LEAVE_ALONE.
 Written by: Claude (2026-11-24), at the owner's request.
 Reviewed by: Grok (651d484), who found the failed-send bug it fixes.
 """
+import calendar
 import json
 import os
 import subprocess
@@ -55,6 +56,12 @@ HOOK_FILES = {
     "devin": [".config/devin/config.json"],
     "vibe": [".vibe/hooks.toml"],
 }
+
+# Open PRs with no review for this long are listed to Y once a day: the
+# Codex fix (comms-deck #164) waited unreviewed while Codex was dark.
+PR_REPOS = [r for r in os.environ.get("CHRONOPHAGE_PR_REPOS", "whyyyyyai/comms-deck,whyyyyyai/chronophage").split(",") if r]
+PR_UNREVIEWED_S = 6 * 3600
+PR_LIST_EVERY_S = 24 * 3600
 
 STALE_BUSY_S = 600        # busy, file unchanged, notes waiting: Stop never ran
 STUCK_S = 300             # ready with notes waiting this long: wake it
@@ -173,6 +180,54 @@ def plan(seats, hooks=None):
     return wakes, problems
 
 
+def unreviewed(prs, now):
+    """From `gh pr list --json number,title,createdAt,isDraft,reviews,comments`,
+    the open PRs older than PR_UNREVIEWED_S with no review and no comment
+    carrying a "Reviewed by:" line. Pure, so it is tested."""
+    out = []
+    for pr in prs:
+        if pr.get("isDraft"):
+            continue
+        try:
+            created = calendar.timegm(time.strptime(pr["createdAt"], "%Y-%m-%dT%H:%M:%SZ"))
+        except (KeyError, ValueError):
+            continue
+        if now - created < PR_UNREVIEWED_S:
+            continue
+        if pr.get("reviews") or any("Reviewed by:" in (c.get("body") or "") for c in pr.get("comments") or []):
+            continue
+        out.append((pr["number"], pr.get("title", ""), int((now - created) // 3600)))
+    return out
+
+
+def list_unreviewed(state, dry, now):
+    """Once a day, tell Y which PRs have waited 6 h+ with no review."""
+    if now - state.get("prs_listed", 0) < PR_LIST_EVERY_S:
+        return
+    lines = []
+    for repo in PR_REPOS:
+        code, out = run(["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
+                         "--json", "number,title,createdAt,isDraft,reviews,comments"], timeout=60)
+        if code != 0:
+            log(f"couldn't list PRs in {repo}: {out[:120]}")
+            return  # try again next pass
+        try:
+            prs = json.loads(out)
+        except ValueError:
+            return
+        name = repo.split("/")[-1]
+        lines += [f"{name} #{n} ({h} h): {t[:70]}" for n, t, h in unreviewed(prs, now)]
+    if lines and not dry:
+        text = "Chronophage: PRs with no review after 6 h+ (oldest risk landing never):\n" + "\n".join(lines[:15])
+        if len(lines) > 15:
+            text += f"\n...and {len(lines) - 15} more"
+        if deck("--from", "chronophage", "send", "owner", "--quiet", text)[0] != 0:
+            return
+    log(("would list" if dry else "listed") + f" {len(lines)} unreviewed PR(s)")
+    if not dry:
+        state["prs_listed"] = now
+
+
 def report(problems, state, dry, now):
     """Tell the owner about new problems, remind hourly, and say when one clears."""
     known = state.setdefault("problems", {})
@@ -230,6 +285,7 @@ def one_pass(dry=False):
         elif result.get("reason") not in ("nothing waiting",):
             problems[f"wake:{seat}"] = f"{seat.title()} has notes it can't be given: {result.get('reason')}."
     report(problems, state, dry, now)
+    list_unreviewed(state, dry, now)
     if not dry:
         save_state(state)
         (STATE_DIR / "status.json").write_text(json.dumps({
@@ -271,6 +327,13 @@ def self_test():
         ("a running agent with no hooks is reported", "hooks:n" in problems),
         ("an agent that isn't running isn't nagged about hooks", "hooks:m" not in problems),
         ("unknown hook files aren't reported", not any(k == "hooks:b" for k in problems)),
+        ("unreviewed PRs: only old, unreviewed, non-draft ones", [n for n, _, _ in unreviewed([
+            {"number": 1, "title": "old", "createdAt": "2026-01-01T00:00:00Z"},
+            {"number": 2, "title": "new", "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+            {"number": 3, "title": "reviewed", "createdAt": "2026-01-01T00:00:00Z", "reviews": [{"state": "APPROVED"}]},
+            {"number": 4, "title": "comment", "createdAt": "2026-01-01T00:00:00Z", "comments": [{"body": "ok\nReviewed by: Devin"}]},
+            {"number": 5, "title": "draft", "createdAt": "2026-01-01T00:00:00Z", "isDraft": True},
+        ], time.time())] == [1]),
         ("a LEAVE_ALONE seat is never touched", not any(s == "z" for s, _ in wakes) and not any(":z" in k for k in problems)),
         ("an agent that isn't running is reported", "away:f" in problems),
         ("an app whose sends fail is reported", "sending:g" in problems),
