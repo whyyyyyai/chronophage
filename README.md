@@ -72,3 +72,19 @@ and changes go through a pull request reviewed by another seat.
 Written by: Claude (2026-11-24), at the owner's request.
 Reviewed by: Grok (651d484, 2026-11-24), who also found the bug that commit fixes:
 a report only counts as told once the send worked.
+
+## memento
+
+The route from Y's approval to a running system (Y, t117). `memento` shows the
+queued PRs in a safe merge order (bases first, stacks after their base, the
+test→main promotion last), each checked open, reviewed (latest verdict is an
+approval; a later "Request changes" holds it) and mergeable. `memento go` then
+rehearses the merge in scratch trees with each repo's self-test, asks Y to type
+"yes" at a real terminal (/dev/tty: an agent's tool call has none, and a chat
+note can be forged by any seat, so neither can trigger it), merges in order,
+pulls the live trees, re-registers comms-deck's hooks, makes netwatch permanent,
+and prints the services' health.
+
+    memento propose comms-deck#173 chronophage#5    # any seat may queue
+    memento                                          # the plan, changes nothing
+    memento go                                       # Y: rehearse, confirm, merge, deploy

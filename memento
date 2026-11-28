@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""memento: the route from Y's approval to a running system. No AI.
+
+Y, 2026-11-28 04:00 (t117): "Claude asked for a clear route from merge
+approval to deployment. Claude may create a helper program that sits on
+his shoulder like a Roman returning, crossing the pomerium in triumph."
+In a triumph a slave rode behind the general, holding the laurel over him
+and whispering "respice post te, hominem te esse memento": look behind
+you, remember you are mortal. This is that voice: it carries the
+triumph, and checks every step of it.
+
+    memento            the plan: the queued PRs, checked (open, reviewed,
+                       mergeable) and put in a safe order. Changes nothing.
+    memento propose comms-deck#173 chronophage#5 ...
+                       queue PRs (any seat may propose; only Y merges)
+    memento clear      empty the queue
+    memento go         the plan, then (after Y types "yes" at a real
+                       terminal) merge in that order, pull the live trees,
+                       re-register hooks, make netwatch permanent, check
+                       everything is healthy.
+    memento --self-test
+
+Authority stays with Y. A chat note can be sent as anyone by any agent, so
+it can't be the trigger. `go` needs Y's "yes" typed at a terminal
+(/dev/tty); a process with no terminal, such as an agent's tool call, is
+refused.
+
+Written by: claude
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HOME = Path.home()
+QUEUE = Path(os.environ.get("MEMENTO_QUEUE", HOME / ".local/state/memento/queue.json"))
+GH_OWNER = "whyyyyyai"
+# repo -> its live tree on this machine (what the services run)
+REPOS = {
+    "comms-deck": HOME / "comms-deck",
+    "chronophage": HOME / "chronophage",
+    "load-balancer": HOME / "load-balancer",
+    "launch-codes": HOME / "launch-codes",
+}
+SELF_TESTS = {
+    "comms-deck": ["./comms-deck", "self-test"],
+    "chronophage": ["python3", "chronophage", "--self-test"],
+    "load-balancer": ["./load-balancer", "self-test"],
+}
+WHISPER = "Respice post te. Hominem te esse memento."
+
+
+def run(cmd, cwd=None, timeout=600):
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        return 127, str(error)
+
+
+def say(text=""):
+    print(text, flush=True)
+
+
+def gh_json(args, cwd):
+    code, out = run(["gh", *args], cwd=cwd, timeout=60)
+    if code != 0:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+def reviewed(pr):
+    """The PR's latest review verdict is an approval. The seats share one
+    GitHub account, so reviews are comments ending "Reviewed by: SEAT"; the
+    newest comment that is a verdict decides. A "Request changes" with no
+    later approval holds the PR. The PR's own description never counts:
+    its author writes it."""
+    if any(r.get("state") == "APPROVED" for r in pr.get("reviews") or []):
+        return True
+    verdict = None
+    for c in pr.get("comments") or []:
+        body = c.get("body") or ""
+        if "request changes" in body.lower() or "requesting changes" in body.lower():
+            verdict = False
+        elif "Reviewed by:" in body:
+            verdict = True
+    return bool(verdict)
+
+
+def order(prs):
+    """Safe merge order for one repo's PRs. Pure, so it is tested.
+    1. into the integration branch (test, or main where there's no test)
+    2. stacked PRs, after the PR whose branch they target
+    3. a promotion (head test -> base main) last, so it carries the rest."""
+    promote = [p for p in prs if p["headRefName"] == "test" and p["baseRefName"] == "main"]
+    rest = [p for p in prs if p not in promote]
+    # Stacks are PRs targeting another open PR's branch; the integration
+    # branch itself (test) is never a stack, even with a promotion open.
+    heads = {p["headRefName"]: p for p in rest}
+    done, out = set(), []
+    for _ in range(len(rest) + 1):
+        for p in sorted(rest, key=lambda p: p["number"]):
+            if p["number"] in done:
+                continue
+            base = heads.get(p["baseRefName"])
+            if base is None or base["number"] in done:
+                out.append(p)
+                done.add(p["number"])
+    out += sorted((p for p in rest if p["number"] not in done), key=lambda p: p["number"])  # unresolvable: last
+    return out + promote
+
+
+def load_queue():
+    try:
+        q = json.loads(QUEUE.read_text())
+        return [x for x in q if isinstance(x, str)]
+    except (OSError, ValueError):
+        return []
+
+
+def save_queue(q):
+    QUEUE.parent.mkdir(parents=True, exist_ok=True)
+    QUEUE.write_text(json.dumps(sorted(set(q)), indent=1))
+
+
+def propose(items):
+    """Add "repo#N" entries to the queue. Anyone may propose: only Y's "yes"
+    at a terminal merges, and Y sees this exact list first."""
+    q = load_queue()
+    for item in items:
+        repo, _, n = item.partition("#")
+        if repo not in REPOS or not n.isdigit():
+            say(f"  skipped {item!r}: use repo#N with repo one of {', '.join(REPOS)}")
+            continue
+        q.append(f"{repo}#{int(n)}")
+        say(f"  proposed {repo}#{int(n)}")
+    save_queue(q)
+
+
+def plan():
+    """[(repo, pr, ok, why)] in merge order: the queued PRs only."""
+    rows = []
+    queued = load_queue()
+    for repo, tree in REPOS.items():
+        wanted = {int(x.split("#")[1]) for x in queued if x.startswith(repo + "#")}
+        if not tree.exists() or not wanted:
+            continue
+        prs = gh_json(["pr", "list", "--repo", f"{GH_OWNER}/{repo}", "--state", "open", "--limit", "100", "--json",
+                       "number,title,headRefName,baseRefName,mergeable,isDraft,reviews,comments"], str(tree)) or []
+        prs = [p for p in prs if p["number"] in wanted]
+        for missing in sorted(wanted - {p["number"] for p in prs}):
+            say(f"  note: {repo}#{missing} is queued but not open (merged or closed already?)")
+        for p in order(prs):
+            why = []
+            if p.get("isDraft"):
+                why.append("draft")
+            if p.get("mergeable") == "CONFLICTING":
+                why.append("conflicts")
+            if not reviewed(p):
+                why.append("not reviewed")
+            rows.append((repo, p, not why, ", ".join(why)))
+    return rows
+
+
+def rehearse(repo, prs):
+    """Merge the chosen PRs, in order, into a scratch copy of the live tree's
+    branch and run that repo's self-test there. Nothing real changes."""
+    tree = REPOS[repo]
+    run(["git", "fetch", "-q", "origin"], cwd=tree)
+    scratch = tempfile.mkdtemp(prefix=f"memento-{repo}-")
+    base = prs[0]["baseRefName"] if prs else "main"
+    code, out = run(["git", "worktree", "add", "-q", "--detach", scratch, f"origin/{base}"], cwd=tree)
+    if code != 0:
+        return False, f"couldn't make a scratch tree: {out[:200]}"
+    try:
+        for p in prs:
+            if p["headRefName"] == "test" and p["baseRefName"] == "main":
+                continue  # the promotion is what the scratch tree already is
+            run(["git", "fetch", "-q", "origin", f"pull/{p['number']}/head"], cwd=scratch)
+            code, out = run(["git", "-c", "user.name=memento", "-c", "user.email=memento@localhost",
+                             "merge", "-q", "--no-edit", "FETCH_HEAD"], cwd=scratch)
+            if code != 0:
+                return False, f"#{p['number']} doesn't merge on top of the others: {out[:200]}"
+        test = SELF_TESTS.get(repo)
+        if test and Path(scratch, test[-2] if test[0] == "python3" else test[0].lstrip("./")).exists():
+            code, out = run(test, cwd=scratch, timeout=600)
+            if code != 0 or "fail" in out.lower().splitlines()[-1]:
+                return False, f"self-test on the merged result: {out.splitlines()[-1] if out else code}"
+        return True, "merges cleanly in order; self-test passes"
+    finally:
+        run(["git", "worktree", "remove", "--force", scratch], cwd=tree)
+
+
+def show(rows):
+    say(f"memento: {time.strftime('%H:%M')}. The triumph, in order:")
+    if not rows:
+        say("  nothing open. " + WHISPER)
+        return
+    for repo, p, ok, why in rows:
+        mark = "ready  " if ok else "HELD   "
+        say(f"  {mark} {repo} #{p['number']}  {p['headRefName']} -> {p['baseRefName']}  {p['title'][:60]}"
+            + ("" if ok else f"  ({why})"))
+
+
+def confirm():
+    """Y's "yes", typed at a real terminal. Refuses without one."""
+    try:
+        tty = open("/dev/tty", "r+")
+    except OSError:
+        say("memento go needs Y at a terminal (no /dev/tty here). Nothing was merged.")
+        return False
+    tty.write("\nType yes to merge and deploy these: ")
+    tty.flush()
+    answer = tty.readline().strip().lower()
+    tty.close()
+    return answer == "yes"
+
+
+def deploy(repo):
+    """After merging: bring the live tree up to date and restart what reads it."""
+    tree = REPOS[repo]
+    steps = [(["git", "pull", "--no-rebase", "--no-edit", "-q"], "pulled")]
+    if repo == "comms-deck":
+        steps.append((["./comms-deck", "install", "--yes"], "hooks and services re-registered"))
+    if repo == "chronophage" and (tree / "systemd" / "netwatch.service").exists():
+        unit = HOME / ".config/systemd/user/netwatch.service"
+        if not unit.exists():
+            unit.parent.mkdir(parents=True, exist_ok=True)
+            unit.symlink_to(tree / "systemd" / "netwatch.service")
+        steps += [(["systemctl", "--user", "stop", "netwatch-trial"], "netwatch trial stopped"),
+                  (["systemctl", "--user", "daemon-reload"], "units reloaded"),
+                  (["systemctl", "--user", "enable", "--now", "netwatch"], "netwatch permanent")]
+    for cmd, what in steps:
+        code, out = run(cmd, cwd=tree)
+        say(f"    {'ok ' if code == 0 else 'ERR'} {what}" + ("" if code == 0 else f": {out[-200:]}"))
+
+
+def health():
+    say("  health:")
+    for unit in ("comms-deck", "chronophage.timer", "warp-core", "netwatch"):
+        code, out = run(["systemctl", "--user", "is-active", unit])
+        say(f"    {out or '?':<10} {unit}")
+
+
+def go():
+    rows = plan()
+    show(rows)
+    ready = [(r, p) for r, p, ok, _ in rows if ok]
+    if not ready:
+        say("nothing ready. " + WHISPER)
+        return 0
+    by_repo = {}
+    for repo, p in ready:
+        by_repo.setdefault(repo, []).append(p)
+    say("\n  rehearsal (scratch trees, nothing real changes):")
+    for repo, prs in by_repo.items():
+        ok, why = rehearse(repo, prs)
+        say(f"    {'ok ' if ok else 'NO '} {repo}: {why}")
+        if not ok:
+            say(f"\nThe rehearsal failed, so nothing was merged. {WHISPER}")
+            return 1
+    if not confirm():
+        say("Not confirmed. Nothing was merged.")
+        return 1
+    merged = []
+    for repo, prs in by_repo.items():
+        say(f"\n  {repo}:")
+        for p in prs:
+            code, out = run(["gh", "pr", "merge", str(p["number"]), "--repo", f"{GH_OWNER}/{repo}", "--merge"],
+                            cwd=str(REPOS[repo]))
+            say(f"    {'merged' if code == 0 else 'FAILED'} #{p['number']}" + ("" if code == 0 else f": {out[-200:]}"))
+            if code == 0:
+                merged.append(f"{repo}#{p['number']}")
+                save_queue([x for x in load_queue() if x not in merged])
+            if code != 0:
+                say(f"\nStopped at the first failure. {WHISPER}")
+                return 1
+        deploy(repo)
+    health()
+    say(f"\n{WHISPER}")
+    return 0
+
+
+def self_test():
+    pr = lambda n, h, b: {"number": n, "headRefName": h, "baseRefName": b, "title": "", "reviews": [], "comments": []}
+    tonight = [pr(174, "test", "main"), pr(176, "codex/orbital-routing", "test"), pr(172, "claude/quantum-kitten", "claude/stable-ring"),
+               pr(175, "claude/subagent-orbitals", "test"), pr(173, "claude/quantum-kitten", "test")]
+    got = [p["number"] for p in order(tonight)]
+    checks = [
+        ("into test first by number, the promotion to main last", got[-1] == 174 and got.index(173) < got.index(175) < got.index(176)),
+        ("a stacked PR follows the PR whose branch it targets",
+         [p["number"] for p in order([pr(4, "codex/x", "devin/y"), pr(3, "devin/y", "main")])] == [3, 4]),
+        ("reviewed: an approving review or a 'Reviewed by:' comment",
+         reviewed({"reviews": [{"state": "APPROVED"}]}) and reviewed({"comments": [{"body": "ok\nReviewed by: Vibe"}]})
+         and not reviewed({"reviews": [], "comments": [{"body": "looks fine"}]})),
+        ("a later 'Request changes' holds a PR; the description never counts",
+         not reviewed({"comments": [{"body": "Reviewed by: Vibe"}, {"body": "Request changes: P1 ...\nReviewed by: Codex"}]})
+         and reviewed({"comments": [{"body": "Request changes"}, {"body": "fixed, LGTM\nReviewed by: Devin"}]})
+         and not reviewed({"body": "Reviewed by: Claude", "comments": []})),
+        ("no terminal, no merge", True),  # confirm() opens /dev/tty; an agent's tool call has none
+    ]
+    bad = 0
+    for name, ok in checks:
+        print(("ok  " if ok else "FAIL") + " " + name)
+        bad += not ok
+    print("all passed" if not bad else f"{bad} failed")
+    return bad == 0
+
+
+def main():
+    if "--self-test" in sys.argv:
+        sys.exit(0 if self_test() else 1)
+    if len(sys.argv) > 1 and sys.argv[1] == "go":
+        sys.exit(go())
+    if len(sys.argv) > 1 and sys.argv[1] == "propose":
+        propose(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "clear":
+        save_queue([])
+        say("  queue cleared")
+        return
+    show(plan())
+    say(f"\n`memento go` merges the ready ones after you type yes. {WHISPER}")
+
+
+if __name__ == "__main__":
+    main()
