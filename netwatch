@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""netwatch: keeps this machine on the internet. No AI.
+
+Y, 2026-11-28 01:25 (t82): "we need a local script that ticks away
+checking to see if we're connected to the internet. If we're not, it
+should try to connect."
+
+Every CHECK_S seconds it opens a TCP connection to a few well-known
+addresses by IP (so a dead DNS server can't fool it). Online if any answer.
+Offline, it works through a ladder, one rung per attempt, waiting a little
+longer each time and never more often than every ATTEMPT_S seconds:
+
+  1. reconnect the wifi device (NetworkManager picks its best network)
+  2. bring up each saved network that is in range, strongest first
+  3. turn the wifi radio off and on again, then reconnect
+  4. try the wired connection, if a cable is in
+
+then starts again from 1 after a pause. Everything goes through `nmcli`,
+which this session may use without sudo (NetworkManager's network-control
+permission). It never forgets, edits or adds a network.
+
+It writes ~/.local/state/netwatch/status.json each check, and tells Y
+through comms-deck (which works offline, on this machine) once the link
+has been down for REPORT_S, and again when it's back, with how long it was
+gone.
+
+    netwatch              run forever (what netwatch.service runs)
+    netwatch --once       one check, and one repair step if offline
+    netwatch --dry-run    one check; say what it would do, change nothing
+    netwatch --self-test  test the decisions
+
+Written by: claude
+"""
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+STATE_DIR = Path(os.environ.get("NETWATCH_STATE", HOME / ".local/state/netwatch"))
+COMMS_DECK = os.environ.get("NETWATCH_COMMS_DECK", str(HOME / ".local/bin/comms-deck"))
+PROBES = [("1.1.1.1", 443), ("8.8.8.8", 53), ("9.9.9.9", 443), ("208.67.222.222", 443)]
+CHECK_S = 15          # between checks while online
+ATTEMPT_S = 20        # at least this long between repair attempts
+ROUND_PAUSE_S = 90    # after the whole ladder failed, before starting again
+REPORT_S = 120        # tell Y once it has been down this long
+
+
+def log(text):
+    print(time.strftime("%H:%M:%S"), text, flush=True)
+
+
+def run(cmd, timeout=40):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        return 127, str(error)
+
+
+def online(probes=PROBES, timeout=3.0):
+    """True if any probe address accepts a TCP connection."""
+    for host, port in probes:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def nm_devices():
+    """[(device, type, state)] from NetworkManager."""
+    code, out = run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device"])
+    if code != 0:
+        return []
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3:
+            rows.append((parts[0], parts[1], parts[2]))
+    return rows
+
+
+def saved_wifi_in_range():
+    """Saved wifi connection names that are in range now, strongest first."""
+    code, out = run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
+    saved = [l.rsplit(":", 1)[0] for l in out.splitlines() if l.endswith(":802-11-wireless")] if code == 0 else []
+    code, out = run(["nmcli", "-t", "-f", "SSID,SIGNAL", "device", "wifi", "list", "--rescan", "yes"], timeout=30)
+    signal = {}
+    if code == 0:
+        for line in out.splitlines():
+            ssid, _, sig = line.rpartition(":")
+            if ssid:
+                signal[ssid.replace("\\:", ":")] = max(signal.get(ssid, 0), int(sig or 0))
+    return rank_saved(saved, signal)
+
+
+def rank_saved(saved, signal):
+    """Saved names seen in the scan, strongest first. (A connection's name is
+    usually its SSID; NetworkManager matches the rest.) Pure, so it is tested."""
+    return sorted([n for n in saved if n in signal], key=lambda n: -signal[n])
+
+
+def ladder(devices):
+    """The repair steps, in order, as (label, [commands]). Pure: tested."""
+    wifi = [d for d, t, _ in devices if t == "wifi"]
+    wired = [d for d, t, s in devices if t == "ethernet" and s != "unavailable"]
+    steps = []
+    for d in wifi:
+        steps.append((f"reconnect {d}", [["nmcli", "device", "connect", d]]))
+    if wifi:
+        steps.append(("saved networks in range", "SAVED"))
+        steps.append(("wifi radio off and on", [["nmcli", "radio", "wifi", "off"], ["sleep", "3"],
+                                                ["nmcli", "radio", "wifi", "on"], ["sleep", "6"]]
+                      + [["nmcli", "device", "connect", d] for d in wifi]))
+    for d in wired:
+        steps.append((f"wired {d}", [["nmcli", "device", "connect", d]]))
+    return steps
+
+
+def next_step(st, now, n_steps):
+    """Which rung to try now, or None to wait. `st` keeps rung, last try and
+    round end. Pure: tested."""
+    if n_steps == 0:
+        return None
+    if now - st.get("tried_at", 0) < ATTEMPT_S:
+        return None
+    if st.get("rung", 0) >= n_steps:
+        if now - st.get("round_done", 0) < ROUND_PAUSE_S:
+            return None
+        st["rung"] = 0
+    return st.get("rung", 0)
+
+
+def tell_y(text):
+    code, out = run([COMMS_DECK, "--from", "netwatch", "send", "owner", text], timeout=20)
+    if code != 0:
+        log(f"couldn't tell Y ({out[:100]})")
+    return code == 0
+
+
+def fmt(secs):
+    secs = int(secs)
+    return f"{secs // 60} min {secs % 60} s" if secs >= 60 else f"{secs} s"
+
+
+def load():
+    try:
+        return json.loads((STATE_DIR / "state.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save(st):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_DIR / "state.json.tmp"
+    tmp.write_text(json.dumps(st, indent=1))
+    tmp.replace(STATE_DIR / "state.json")
+    (STATE_DIR / "status.json").write_text(json.dumps({
+        "time": time.time(), "online": st.get("online"), "down_since": st.get("down_since"),
+        "last_step": st.get("last_step"), "rung": st.get("rung", 0)}, indent=1))
+
+
+def tick(st, dry=False):
+    """One check, and one repair step if offline. Returns online."""
+    now = time.time()
+    up = online()
+    was = st.get("online")
+    if up:
+        if was is False:
+            gone = now - (st.get("down_since") or now)
+            log(f"back online after {fmt(gone)} (last step: {st.get('last_step')})")
+            if st.get("reported") and not dry:
+                tell_y(f"netwatch: internet is back after {fmt(gone)} down (fixed by: {st.get('last_step') or 'itself'}).")
+        st.update(online=True, down_since=None, rung=0, tried_at=0, reported=False)
+        return True
+    if was is not False:
+        log("offline: no probe answered")
+        st.update(online=False, down_since=now, rung=0, tried_at=0, reported=False)
+    if not st.get("reported") and now - st["down_since"] >= REPORT_S and not dry:
+        st["reported"] = tell_y(f"netwatch: no internet for {fmt(now - st['down_since'])}; trying to reconnect (step {st.get('rung', 0) + 1}).")
+    steps = ladder(nm_devices())
+    rung = next_step(st, now, len(steps))
+    if rung is None:
+        return False
+    label, cmds = steps[rung]
+    if cmds == "SAVED":
+        cmds = [["nmcli", "connection", "up", "id", n] for n in saved_wifi_in_range()]
+    if dry:
+        log(f"would try step {rung + 1}/{len(steps)}: {label}: {cmds}")
+        return False
+    log(f"trying step {rung + 1}/{len(steps)}: {label}")
+    for c in cmds:
+        code, out = run(c)
+        if c[0] == "nmcli":
+            log(f"  {' '.join(c)} -> {code} {out[:120]}")
+        if c[:3] == ["nmcli", "connection", "up"] and code == 0 and online():
+            break
+    st.update(rung=rung + 1, tried_at=time.time(), last_step=label)
+    if st["rung"] >= len(steps):
+        st["round_done"] = time.time()
+    return False
+
+
+def self_test():
+    checks = []
+    devs = [("wld0", "wifi", "disconnected"), ("end0", "ethernet", "unavailable"), ("lo", "loopback", "connected")]
+    steps = ladder(devs)
+    checks.append(("ladder: reconnect wifi, saved networks, radio cycle; no unplugged cable",
+                   [s[0] for s in steps] == ["reconnect wld0", "saved networks in range", "wifi radio off and on"]))
+    steps2 = ladder(devs[:1] + [("end0", "ethernet", "disconnected")])
+    checks.append(("ladder: a plugged-in cable is the last step", steps2[-1][0] == "wired end0"))
+    checks.append(("no devices, no steps", ladder([]) == []))
+    st = {}
+    checks.append(("first attempt is step 1 at once", next_step(st, 1000, 3) == 0))
+    st = {"rung": 1, "tried_at": 1000}
+    checks.append(("no new attempt within ATTEMPT_S", next_step(st, 1000 + ATTEMPT_S - 1, 3) is None))
+    checks.append(("next rung after ATTEMPT_S", next_step(st, 1000 + ATTEMPT_S, 3) == 1))
+    st = {"rung": 3, "tried_at": 0, "round_done": 2000}
+    checks.append(("after the whole ladder, a pause", next_step(st, 2000 + ROUND_PAUSE_S - 1, 3) is None))
+    checks.append(("then it starts again from step 1", next_step(st, 2000 + ROUND_PAUSE_S, 3) == 0 and st["rung"] == 0))
+    checks.append(("saved networks: in range only, strongest first",
+                   rank_saved(["iPhone", "Home", "Cafe"], {"Cafe": 40, "iPhone": 70}) == ["iPhone", "Cafe"]))
+    checks.append(("a closed port is offline", not online([("127.0.0.1", 9)], timeout=0.5)))
+    checks.append(("time reads plainly", fmt(45) == "45 s" and fmt(125) == "2 min 5 s"))
+    bad = 0
+    for name, ok in checks:
+        print(("ok  " if ok else "FAIL") + " " + name)
+        bad += not ok
+    print("all passed" if not bad else f"{bad} failed")
+    return bad == 0
+
+
+def main():
+    if "--self-test" in sys.argv:
+        sys.exit(0 if self_test() else 1)
+    dry = "--dry-run" in sys.argv
+    if dry or "--once" in sys.argv:
+        st = load()
+        up = tick(st, dry=dry)
+        if not dry:
+            save(st)
+        log("online" if up else "offline")
+        return
+    log("netwatch started")
+    while True:
+        st = load()
+        try:
+            up = tick(st)
+        except Exception as error:  # never die: the service would only restart it
+            log(f"check failed: {error}")
+            up = False
+        save(st)
+        time.sleep(CHECK_S if up else 5)
+
+
+if __name__ == "__main__":
+    main()

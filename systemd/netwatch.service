@@ -1,0 +1,17 @@
+# netwatch: keeps the iMac on the internet (Y, t82). No AI.
+# Checks every 15 s; offline, it reconnects through NetworkManager.
+# Install: ln -sf %h/chronophage/systemd/netwatch.service ~/.config/systemd/user/
+#          systemctl --user daemon-reload && systemctl --user enable --now netwatch
+# Written by: claude (2026-11-28)
+[Unit]
+Description=netwatch: keep this machine on the internet (no AI)
+After=NetworkManager.service
+
+[Service]
+ExecStart=%h/chronophage/netwatch
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

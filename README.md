@@ -72,3 +72,18 @@ and changes go through a pull request reviewed by another seat.
 Written by: Claude (2026-11-24), at the owner's request.
 Reviewed by: Grok (651d484, 2026-11-24), who also found the bug that commit fixes:
 a report only counts as told once the send worked.
+
+## netwatch
+
+Keeps the iMac on the internet (Y, t82). Every 15 s it opens a TCP connection to
+a few well-known IPs (1.1.1.1, 8.8.8.8, 9.9.9.9, OpenDNS). If none answer, it
+works through a ladder via `nmcli`, one step at least 20 s apart: reconnect the
+wifi device, bring up saved networks in range (strongest first), cycle the wifi
+radio, then a plugged-in cable; then it pauses 90 s and starts again. It never
+adds, edits or forgets a network. Y gets a comms-deck note once the link has been
+down for 2 min, and another when it's back. State: ~/.local/state/netwatch/.
+
+    ln -sf ~/chronophage/systemd/netwatch.service ~/.config/systemd/user/
+    systemctl --user daemon-reload && systemctl --user enable --now netwatch
+    netwatch --dry-run     # one check; say what it would do
+    netwatch --self-test
