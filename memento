@@ -14,21 +14,24 @@ triumph, and checks every step of it.
     memento propose comms-deck#173 chronophage#5 ...
                        queue PRs (any seat may propose; only Y merges)
     memento clear      empty the queue
-    memento go         the plan, then (after Y types "yes" at a real
-                       terminal) merge in that order, pull the live trees,
+    memento go         the plan, then (after Y's click on warp-core's
+                       TRIUMPH button, or "yes" typed at a real terminal)
+                       merge in that order, pull the live trees,
                        re-register hooks, make netwatch permanent, check
                        everything is healthy.
     memento --self-test
 
 Authority stays with Y. A chat note can be sent as anyone by any agent, so
-it can't be the trigger. `go` needs Y's "yes" typed at a terminal
-(/dev/tty); a process with no terminal, such as an agent's tool call, is
-refused.
+it can't be the trigger. `go` needs Y's click on warp-core (a token bound
+to the current queue, good for two minutes, spent once) or "yes" typed at
+a terminal (/dev/tty); a process with neither is refused.
 
 Written by: claude
 """
+import hashlib
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -37,6 +40,13 @@ from pathlib import Path
 
 HOME = Path.home()
 QUEUE = Path(os.environ.get("MEMENTO_QUEUE", HOME / ".local/state/memento/queue.json"))
+STATE = Path(os.environ.get("MEMENTO_STATE", HOME / ".local/state/memento"))
+NEEDS = STATE / "needs-approval.json"
+APPROVED = STATE / "approved.json"
+# A click-approval is good for two minutes and works once: long enough for
+# warp-core to spawn `memento go`, short enough that a stale click can't
+# approve a queue that changed since.
+APPROVAL_TTL = 120
 GH_OWNER = "whyyyyyai"
 # repo -> its live tree on this machine (what the services run)
 REPOS = {
@@ -126,6 +136,52 @@ def load_queue():
 def save_queue(q):
     QUEUE.parent.mkdir(parents=True, exist_ok=True)
     QUEUE.write_text(json.dumps(sorted(set(q)), indent=1))
+    refresh_approval()
+
+
+def queue_hash():
+    return hashlib.sha256(json.dumps(load_queue()).encode()).hexdigest()[:16]
+
+
+def refresh_approval():
+    """Keep needs-approval.json in step with the queue. warp-core watches it:
+    a non-empty queue means Y can approve the merge with a click instead of
+    typing yes at a terminal. The token is bound to the queue's contents, so
+    any change (propose, merge, clear) retires outstanding approvals."""
+    try:
+        q = load_queue()
+        if not q:
+            NEEDS.unlink(missing_ok=True)
+            APPROVED.unlink(missing_ok=True)
+            return
+        h = queue_hash()
+        try:
+            cur = json.loads(NEEDS.read_text())
+            if cur.get("hash") == h and cur.get("token"):
+                return
+        except (OSError, ValueError):
+            pass
+        APPROVED.unlink(missing_ok=True)
+        STATE.mkdir(parents=True, exist_ok=True)
+        NEEDS.write_text(json.dumps({"token": secrets.token_hex(8), "hash": h,
+                                     "prs": q, "time": time.strftime("%Y-%m-%d %H:%M:%S")}))
+    except OSError:
+        pass
+
+
+def click_approved():
+    """True if warp-core recorded Y's click for exactly this queue, recently.
+    Consumes the approval so it can't be replayed."""
+    try:
+        need = json.loads(NEEDS.read_text())
+        got = json.loads(APPROVED.read_text())
+        fresh = time.time() - APPROVED.stat().st_mtime < APPROVAL_TTL
+        if got.get("token") == need.get("token") and need.get("hash") == queue_hash() and fresh:
+            APPROVED.unlink(missing_ok=True)
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
 
 
 def propose(items):
@@ -214,11 +270,15 @@ def show(rows):
 
 
 def confirm():
-    """Y's "yes", typed at a real terminal. Refuses without one."""
+    """Y's approval: a click on warp-core's TRIUMPH button, or "yes" typed at
+    a real terminal. Refuses without one."""
+    if click_approved():
+        say("  approved by Y's click on warp-core.")
+        return True
     try:
         tty = open("/dev/tty", "r+")
     except OSError:
-        say("memento go needs Y at a terminal (no /dev/tty here). Nothing was merged.")
+        say("memento go needs Y's click on warp-core or a terminal (no /dev/tty here). Nothing was merged.")
         return False
     tty.write("\nType yes to merge and deploy these: ")
     tty.flush()
@@ -254,6 +314,7 @@ def health():
 
 
 def go():
+    refresh_approval()
     rows = plan()
     show(rows)
     ready = [(r, p) for r, p, ok, _ in rows if ok]
@@ -333,6 +394,29 @@ def self_test():
          and not reviewed({"body": "Reviewed by: Claude", "comments": []})),
         ("no terminal, no merge", True),  # confirm() opens /dev/tty; an agent's tool call has none
     ]
+    # Click-approval: a token bound to the queue, fresh, spent once.
+    global QUEUE, STATE, NEEDS, APPROVED
+    saved = (QUEUE, STATE, NEEDS, APPROVED)
+    tmp = Path(tempfile.mkdtemp(prefix="memento-test-"))
+    QUEUE, STATE, NEEDS, APPROVED = tmp / "queue.json", tmp, tmp / "needs-approval.json", tmp / "approved.json"
+    try:
+        save_queue(["comms-deck#1"])
+        need = json.loads(NEEDS.read_text())
+        checks += [
+            ("a non-empty queue offers a click-approval token", bool(need.get("token")) and need.get("hash") == queue_hash()),
+            ("no click, no approval", not click_approved()),
+        ]
+        APPROVED.write_text(json.dumps({"token": "wrong"}))
+        checks.append(("a wrong token doesn't approve", not click_approved()))
+        APPROVED.write_text(json.dumps({"token": need["token"]}))
+        os.utime(APPROVED, (time.time() - APPROVAL_TTL - 1, time.time() - APPROVAL_TTL - 1))
+        checks.append(("a stale click doesn't approve", not click_approved()))
+        APPROVED.write_text(json.dumps({"token": need["token"]}))
+        checks.append(("a fresh matching click approves, once", click_approved() and not click_approved()))
+        save_queue([])
+        checks.append(("clearing the queue retires the approval files", not NEEDS.exists() and not APPROVED.exists()))
+    finally:
+        QUEUE, STATE, NEEDS, APPROVED = saved
     bad = 0
     for name, ok in checks:
         print(("ok  " if ok else "FAIL") + " " + name)
@@ -358,7 +442,8 @@ def main():
         say("  queue cleared")
         return
     show(plan())
-    say(f"\n`memento go` merges the ready ones after you type yes. {WHISPER}")
+    refresh_approval()
+    say(f"\n`memento go` merges the ready ones after Y's click on warp-core or a typed yes. {WHISPER}")
 
 
 if __name__ == "__main__":
