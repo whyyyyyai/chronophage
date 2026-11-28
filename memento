@@ -95,25 +95,24 @@ def reviewed(pr):
 
 def order(prs):
     """Safe merge order for one repo's PRs. Pure, so it is tested.
-    1. into the integration branch (test, or main where there's no test)
-    2. stacked PRs, after the PR whose branch they target
+    1. stacked PRs first, deepest first: each merges into the branch of the
+       PR it targets, so that PR then carries it on (merged after its parent
+       had gone, a stacked PR would land on a dead branch)
+    2. then PRs into the integration branch (test, or main), by number
     3. a promotion (head test -> base main) last, so it carries the rest."""
     promote = [p for p in prs if p["headRefName"] == "test" and p["baseRefName"] == "main"]
     rest = [p for p in prs if p not in promote]
     # Stacks are PRs targeting another open PR's branch; the integration
     # branch itself (test) is never a stack, even with a promotion open.
     heads = {p["headRefName"]: p for p in rest}
-    done, out = set(), []
-    for _ in range(len(rest) + 1):
-        for p in sorted(rest, key=lambda p: p["number"]):
-            if p["number"] in done:
-                continue
-            base = heads.get(p["baseRefName"])
-            if base is None or base["number"] in done:
-                out.append(p)
-                done.add(p["number"])
-    out += sorted((p for p in rest if p["number"] not in done), key=lambda p: p["number"])  # unresolvable: last
-    return out + promote
+
+    def depth(p, seen=()):
+        base = heads.get(p["baseRefName"])
+        if base is None or base["number"] in seen:
+            return 0
+        return 1 + depth(base, seen + (p["number"],))
+
+    return sorted(rest, key=lambda p: (-depth(p), p["number"])) + promote
 
 
 def load_queue():
@@ -277,7 +276,22 @@ def go():
     merged = []
     for repo, prs in by_repo.items():
         say(f"\n  {repo}:")
+        merged_into = {}  # branch -> (its head before, the child head merged into it)
         for p in prs:
+            if p["headRefName"] in merged_into:
+                # A child was just merged into this PR's branch, so its head
+                # moved. Accept the new head only if it is exactly the old head
+                # plus that child: nothing unrehearsed rides along.
+                before, child = merged_into[p["headRefName"]]
+                fresh = gh_json(["pr", "view", str(p["number"]), "--repo", f"{GH_OWNER}/{repo}", "--json", "headRefOid"],
+                                str(REPOS[repo])) or {}
+                new = fresh.get("headRefOid", "")
+                run(["git", "fetch", "-q", "origin", p["headRefName"]], cwd=REPOS[repo])
+                code, parents = run(["git", "rev-list", "--parents", "-n", "1", new], cwd=REPOS[repo])
+                if code != 0 or set(parents.split()[1:]) != {before, child}:
+                    say(f"    STOP   #{p['number']}: its branch changed beyond the merged child. {WHISPER}")
+                    return 1
+                p["headRefOid"] = new
             # Pinned to the rehearsed commit (Devin's review): if the PR moved
             # between the plan and Y's yes, GitHub refuses and we stop.
             pin = ["--match-head-commit", p["headRefOid"]] if p.get("headRefOid") else []
@@ -286,6 +300,9 @@ def go():
             say(f"    {'merged' if code == 0 else 'FAILED'} #{p['number']}" + ("" if code == 0 else f": {out[-200:]}"))
             if code == 0:
                 merged.append(f"{repo}#{p['number']}")
+                base_pr = next((q for q in prs if q["headRefName"] == p["baseRefName"]), None)
+                if base_pr:
+                    merged_into[p["baseRefName"]] = (base_pr.get("headRefOid", ""), p.get("headRefOid", ""))
                 save_queue([x for x in load_queue() if x not in merged])
             if code != 0:
                 say(f"\nStopped at the first failure. {WHISPER}")
@@ -302,9 +319,11 @@ def self_test():
                pr(175, "claude/subagent-orbitals", "test"), pr(173, "claude/quantum-kitten", "test")]
     got = [p["number"] for p in order(tonight)]
     checks = [
-        ("into test first by number, the promotion to main last", got[-1] == 174 and got.index(173) < got.index(175) < got.index(176)),
-        ("a stacked PR follows the PR whose branch it targets",
-         [p["number"] for p in order([pr(4, "codex/x", "devin/y"), pr(3, "devin/y", "main")])] == [3, 4]),
+        ("into test by number, the stack on #173 before it, the promotion last",
+         got[-1] == 174 and got.index(172) < got.index(173) < got.index(175) < got.index(176)),
+        ("a stacked PR merges first, into its parent's branch, so the parent carries it",
+         [p["number"] for p in order([pr(3, "devin/y", "main"), pr(4, "codex/x", "devin/y")])] == [4, 3]
+         and [p["number"] for p in order([pr(173, "kitten", "test"), pr(178, "luna", "kitten"), pr(179, "deeper", "luna")])] == [179, 178, 173]),
         ("reviewed: an approving review or a 'Reviewed by:' comment",
          reviewed({"reviews": [{"state": "APPROVED"}]}) and reviewed({"comments": [{"body": "ok\nReviewed by: Vibe"}]})
          and not reviewed({"reviews": [], "comments": [{"body": "looks fine"}]})),
