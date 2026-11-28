@@ -21,7 +21,7 @@ every agent is offline.
    | ready, but notes have waited 5 min | `comms-deck wake <seat>` |
    | out of usage (idle until its reset) | nothing: the notes wait for the reset |
    | paused by the loop guard, a draft holding notes back, an app whose sends keep failing, an agent that isn't running, an app that hasn't checked in 30 min | tells the owner |
-   | codex (paused by the owner), hidden seats | nothing |
+   | hidden seats, seats in `CHRONOPHAGE_LEAVE_ALONE` (comma-separated; empty by default) | nothing |
 
 3. **Reports.** Each problem goes to the owner's chat screen once, then at
    most once an hour while it lasts. When it clears, one quiet note says so.

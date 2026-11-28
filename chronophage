@@ -20,7 +20,7 @@ Run once a minute by chronophage.timer. Each pass:
 
 It never runs a model, never deletes a note, never types anything itself
 (waking goes through comms-deck, which has its own checks), and never
-touches a seat the owner has paused (codex) or hidden.
+touches a seat the owner has hidden or listed in CHRONOPHAGE_LEAVE_ALONE.
 
     chronophage              one pass (what the timer runs)
     chronophage --dry-run    one pass that only says what it would do
@@ -40,7 +40,9 @@ HOME = Path.home()
 COMMS_DECK = os.environ.get("CHRONOPHAGE_COMMS_DECK", str(HOME / ".local/bin/comms-deck"))
 STATE_DIR = Path(os.environ.get("CHRONOPHAGE_STATE", HOME / ".local/state/chronophage"))
 SERVICES = ("comms-deck.service", "push-courier.service")
-LEAVE_ALONE = {"codex"}   # paused by the owner: watched, never woken or reported
+# Seats the owner has paused: watched, never woken or reported. Codex was
+# here until Y brought it back (2026-11-27). Comma-separated seat names.
+LEAVE_ALONE = {s.strip() for s in os.environ.get("CHRONOPHAGE_LEAVE_ALONE", "").split(",") if s.strip()}
 
 STALE_BUSY_S = 600        # busy, file unchanged, notes waiting: Stop never ran
 STUCK_S = 300             # ready with notes waiting this long: wake it
@@ -212,21 +214,25 @@ def self_test():
         "c": {**base, "state": "idle", "spent_until": 1e12},         # spent: leave
         "d": {**base, "state": "idle", "paused": True},              # report paused
         "e": {**base, "state": "busy", "file_age_s": 30},            # really busy
-        "codex": {**base, "state": "idle"},                          # owner's pause
+        "codex": {**base, "state": "idle"},                          # back: woken like any seat
+        "z": {**base, "state": "idle"},                              # owner's pause (LEAVE_ALONE)
         "f": {**base, "state": "away", "oldest_waiting_s": 4000},    # not running
         "g": {**base, "kind": "app", "state": "idle", "retry_at": 1.0},
         "h": {**base, "state": "idle", "hidden": True},
         "i": {**base, "state": "idle", "waiting_normal": 0},
         "lumo": {**base, "kind": "app", "state": "idle", "oldest_waiting_s": 2000},
     }
+    LEAVE_ALONE.add("z")
     wakes, problems = plan(seats)
+    LEAVE_ALONE.discard("z")
     checks = [
         ("stale busy is woken with --stale", ("a", True) in wakes),
         ("a stuck ready seat is woken", ("b", False) in wakes),
         ("a spent seat is left alone", not any(s == "c" for s, _ in wakes) and not any(":c" in k for k in problems)),
         ("the loop guard is reported, not woken", "paused:d" in problems and not any(s == "d" for s, _ in wakes)),
         ("a truly busy seat is left alone", not any(s == "e" for s, _ in wakes)),
-        ("codex is never touched", not any(s == "codex" for s, _ in wakes) and not any("codex" in k for k in problems)),
+        ("a stuck codex is woken like any seat", ("codex", False) in wakes),
+        ("a LEAVE_ALONE seat is never touched", not any(s == "z" for s, _ in wakes) and not any(":z" in k for k in problems)),
         ("an agent that isn't running is reported", "away:f" in problems),
         ("an app whose sends fail is reported", "sending:g" in problems),
         ("an app seat that hasn't checked for 30 min is reported", "unread:lumo" in problems),
