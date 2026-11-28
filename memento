@@ -314,6 +314,10 @@ def self_test():
 
 
 def main():
+    # A stop (SIGTERM) runs the cleanup too, so a killed rehearsal never
+    # leaves a scratch worktree behind.
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     if "--self-test" in sys.argv:
         sys.exit(0 if self_test() else 1)
     if len(sys.argv) > 1 and sys.argv[1] == "go":
