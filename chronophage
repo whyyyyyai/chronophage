@@ -156,6 +156,60 @@ def settle(dry):
     return changed
 
 
+APP_SEATS_FILE = Path(os.environ.get("CHRONOPHAGE_APP_SEATS", HOME / ".config/comms-deck/app-seats"))
+
+
+def window_apps(text):
+    """{seat: window class} for the app seats that live in their own app
+    window ("lumo:lumo-desktop"), from comms-deck's app-seats file. Grok Bot
+    seats share one app and remote seats have no window here: skipped."""
+    out = {}
+    for line in text.splitlines():
+        words = line.split("#")[0].split()
+        if not words:
+            continue
+        seat, _, app = words[0].partition(":")
+        if app and app not in ("grok-bot", "remote"):
+            out[seat] = app
+    return out
+
+
+def window_problems(seats, apps, classes, prev):
+    """Y, t79: an app seat shows on the warp core only while its window is
+    open, and the other way round. Compare Hyprland's open windows with the
+    deck's state: open but "away", or closed but anything else, is a
+    mismatch. Reported only when it holds on two passes in a row (a window
+    caught mid-open isn't one). Returns (problems, this pass's mismatches)."""
+    now_bad, problems = {}, {}
+    if classes is None:
+        return problems, now_bad
+    for seat, cls in sorted(apps.items()):
+        s = seats.get(seat)
+        if s is None or s.get("hidden"):
+            continue
+        open_ = cls in classes
+        away = s.get("state") == "away"
+        if open_ == away:
+            now_bad[seat] = "open" if open_ else "closed"
+            if prev.get(seat) == now_bad[seat]:
+                problems[f"window:{seat}"] = (
+                    f"{seat.title()}'s window is open but the deck shows her away, so she's missing from the warp core."
+                    if open_ else
+                    f"{seat.title()}'s window is closed but the deck shows her {s.get('state')}, so she still shows on the warp core.")
+    return problems, now_bad
+
+
+def window_classes():
+    """Classes of the open Hyprland windows, or None if Hyprland can't be asked."""
+    code, out = run(["hyprctl", "clients", "-j"], timeout=10)
+    if code != 0:
+        return None
+    try:
+        return {c.get("class", "") for c in json.loads(out or "[]")}
+    except ValueError:
+        return None
+
+
 def plan(seats, hooks=None):
     """Decide, from `status --json` seats, what to wake and what to report.
     `hooks` is {seat: has_hooks(seat)}; missing means unknown.
@@ -292,6 +346,12 @@ def one_pass(dry=False):
     else:
         problems["status"] = f"comms-deck status --json failed: {out[:200]}"
     wakes, seat_problems = plan(seats, {seat: has_hooks(seat) for seat in seats})
+    try:
+        apps = window_apps(APP_SEATS_FILE.read_text())
+    except OSError:
+        apps = {}
+    win_problems, state["window_mismatch"] = window_problems(seats, apps, window_classes() if apps else None, state.get("window_mismatch", {}))
+    seat_problems.update(win_problems)
     problems.update(seat_problems)
     woken = []
     for seat, stale in wakes:
@@ -331,6 +391,19 @@ def settle_check():
         return ok
     finally:
         deck = real
+
+
+def window_check():
+    apps = {"lumo": "lumo-desktop"}
+    idle, away = {"lumo": {"state": "idle"}}, {"lumo": {"state": "away"}}
+    p1, bad = window_problems(idle, apps, {"kitty"}, {})
+    p2, bad2 = window_problems(idle, apps, {"kitty"}, bad)
+    p3, _ = window_problems(away, apps, {"lumo-desktop"}, {"lumo": "open"})
+    ok_open, _ = window_problems(idle, apps, {"lumo-desktop"}, {"lumo": "closed"})
+    ok_closed, _ = window_problems(away, apps, {"kitty"}, {"lumo": "closed"})
+    no_wm, _ = window_problems(idle, apps, None, {"lumo": "closed"})
+    return (not p1 and "window:lumo" in p2 and "closed" in p2["window:lumo"]
+            and "open" in p3["window:lumo"] and not ok_open and not ok_closed and not no_wm)
 
 
 def self_test():
@@ -373,6 +446,9 @@ def self_test():
             {"number": 5, "title": "draft", "createdAt": "2026-01-01T00:00:00Z", "isDraft": True},
         ], time.time())] == [1]),
         ("settle reads the deck's answer and skips an old deck", settle_check()),
+        ("app windows: lumo:lumo-desktop is watched, grok-bot and remote seats aren't",
+         window_apps("alice\nlumo:lumo-desktop  # Lumo\nmystra:remote\n") == {"lumo": "lumo-desktop"}),
+        ("a window mismatch is reported only on the second pass, both ways", window_check()),
         ("a LEAVE_ALONE seat is never touched", not any(s == "z" for s, _ in wakes) and not any(":z" in k for k in problems)),
         ("an agent that isn't running is reported", "away:f" in problems),
         ("an app whose sends fail is reported", "sending:g" in problems),
