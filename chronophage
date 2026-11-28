@@ -29,6 +29,7 @@ touches a seat the owner has hidden or listed in CHRONOPHAGE_LEAVE_ALONE.
 Written by: Claude (2026-11-24), at the owner's request.
 Reviewed by: Grok (651d484), who found the failed-send bug it fixes.
 """
+import calendar
 import json
 import os
 import subprocess
@@ -43,6 +44,24 @@ SERVICES = ("comms-deck.service", "push-courier.service")
 # Seats the owner has paused: watched, never woken or reported. Codex was
 # here until Y brought it back (2026-11-27). Comma-separated seat names.
 LEAVE_ALONE = {s.strip() for s in os.environ.get("CHRONOPHAGE_LEAVE_ALONE", "").split(",") if s.strip()}
+
+# Where each agent's comms-deck hooks live. An agent with none never tells
+# the deck its turn ended, so it freezes at "busy" and its notes queue up:
+# Codex, 22:32-22:58 on 27 Nov (its hooks PR sat unmerged). Any of the
+# files holding "comms-deck hook" counts.
+HOOK_FILES = {
+    "claude": [".claude/settings.json"],
+    "grok": [".grok/hooks/comms-deck.json"],
+    "codex": [".codex/hooks.json"],
+    "devin": [".config/devin/config.json"],
+    "vibe": [".vibe/hooks.toml"],
+}
+
+# Open PRs with no review for this long are listed to Y once a day: the
+# Codex fix (comms-deck #164) waited unreviewed while Codex was dark.
+PR_REPOS = [r for r in os.environ.get("CHRONOPHAGE_PR_REPOS", "whyyyyyai/comms-deck,whyyyyyai/chronophage").split(",") if r]
+PR_UNREVIEWED_S = 6 * 3600
+PR_LIST_EVERY_S = 24 * 3600
 
 STALE_BUSY_S = 600        # busy, file unchanged, notes waiting: Stop never ran
 STUCK_S = 300             # ready with notes waiting this long: wake it
@@ -101,15 +120,59 @@ def check_services(dry):
     return problems
 
 
-def plan(seats):
+def has_hooks(seat):
+    """True if one of the seat's hook files has comms-deck hooks; None if we don't know where they live."""
+    files = HOOK_FILES.get(seat)
+    if not files:
+        return None
+    for rel in files:
+        try:
+            if "comms-deck hook" in (HOME / rel).read_text():
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def settle(dry):
+    """Match each screen-read seat's busy/idle to its window, both ways
+    (`comms-deck settle`): busy with an idle prompt on screen becomes idle,
+    so its notes are delivered; idle with a turn running becomes busy, so no
+    note is pasted into it. Y, 23:49 on 27 Nov: "there should be scripts and
+    programs in the chronophage that automate these kind of triggers (and
+    their inverse)", rather than an agent fixing seat states by hand.
+    Returns the changes. A deck too old to have `settle` is skipped."""
+    if dry:
+        return []
+    code, out = deck("settle")
+    if code != 0:
+        return []  # older comms-deck without the command: nothing to do
+    try:
+        changed = json.loads(out.splitlines()[-1]).get("changed", [])
+    except (ValueError, IndexError, AttributeError):
+        return []
+    for c in changed:
+        log(f"settled {c['seat']}: {c['from']} -> {c['to']} (from its screen)")
+    return changed
+
+
+def plan(seats, hooks=None):
     """Decide, from `status --json` seats, what to wake and what to report.
+    `hooks` is {seat: has_hooks(seat)}; missing means unknown.
 
     Returns (wakes [(seat, stale)], problems {key: text}). Pure, so it is tested.
     """
     wakes, problems = [], {}
+    hooks = hooks or {}
     for seat, s in seats.items():
         if s.get("hidden") or seat in LEAVE_ALONE:
             continue
+        # Checked whether or not notes wait: missing hooks are the cause, a
+        # stuck queue only the symptom.
+        if s.get("kind") == "agent" and s.get("state") != "away" and hooks.get(seat) is False:
+            problems[f"hooks:{seat}"] = (f"{seat.title()} is running with no comms-deck hooks installed, so the deck "
+                                         f"never sees its turns end and its notes will queue. Run `comms-deck install`; "
+                                         f"for Codex, then trust them with /hooks inside Codex.")
         if s.get("spent_until"):
             continue  # out of usage: its notes wait for the reset
         waiting, oldest = s.get("waiting_normal", 0), s.get("oldest_waiting_s", 0)
@@ -137,6 +200,55 @@ def plan(seats):
                 problems[f"unread:{seat}"] = (f"{seat.title()} hasn't picked up {waiting} note(s) in {oldest // 60} min. "
                                               f"If it only checks when asked (Lumo), ask it in its window to read its notes.")
     return wakes, problems
+
+
+def unreviewed(prs, now):
+    """From `gh pr list --json number,title,createdAt,isDraft,reviews,comments`,
+    the open PRs older than PR_UNREVIEWED_S with no review and no comment
+    carrying a "Reviewed by:" line. Pure, so it is tested."""
+    out = []
+    for pr in prs:
+        if pr.get("isDraft"):
+            continue
+        try:
+            created = calendar.timegm(time.strptime(pr["createdAt"], "%Y-%m-%dT%H:%M:%SZ"))
+        except (KeyError, ValueError):
+            continue
+        if now - created < PR_UNREVIEWED_S:
+            continue
+        if pr.get("reviews") or any("Reviewed by:" in (c.get("body") or "") for c in pr.get("comments") or []):
+            continue
+        out.append((pr["number"], pr.get("title", ""), int((now - created) // 3600)))
+    return out
+
+
+def list_unreviewed(state, dry, now):
+    """Once a day, tell Y which PRs have waited 6 h+ with no review."""
+    if now - state.get("prs_listed", 0) < PR_LIST_EVERY_S or now - state.get("prs_tried", 0) < 3600:
+        return
+    state["prs_tried"] = now  # a failing gh (offline, logged out) is retried hourly, not every pass
+    lines = []
+    for repo in PR_REPOS:
+        code, out = run(["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
+                         "--json", "number,title,createdAt,isDraft,reviews,comments"], timeout=60)
+        if code != 0:
+            log(f"couldn't list PRs in {repo}: {out[:120]}")
+            return  # try again next pass
+        try:
+            prs = json.loads(out)
+        except ValueError:
+            return
+        name = repo.split("/")[-1]
+        lines += [f"{name} #{n} ({h} h): {t[:70]}" for n, t, h in unreviewed(prs, now)]
+    if lines and not dry:
+        text = "Chronophage: PRs with no review after 6 h+ (oldest risk landing never):\n" + "\n".join(lines[:15])
+        if len(lines) > 15:
+            text += f"\n...and {len(lines) - 15} more"
+        if deck("--from", "chronophage", "send", "owner", "--quiet", text)[0] != 0:
+            return
+    log(("would list" if dry else "listed") + f" {len(lines)} unreviewed PR(s)")
+    if not dry:
+        state["prs_listed"] = now
 
 
 def report(problems, state, dry, now):
@@ -169,6 +281,7 @@ def one_pass(dry=False):
     now = time.time()
     state = load_state()
     problems = check_services(dry)
+    settled = settle(dry)
     code, out = deck("status", "--json")
     seats = {}
     if code == 0:
@@ -178,7 +291,7 @@ def one_pass(dry=False):
             problems["status"] = "comms-deck status --json returned something unreadable."
     else:
         problems["status"] = f"comms-deck status --json failed: {out[:200]}"
-    wakes, seat_problems = plan(seats)
+    wakes, seat_problems = plan(seats, {seat: has_hooks(seat) for seat in seats})
     problems.update(seat_problems)
     woken = []
     for seat, stale in wakes:
@@ -196,13 +309,28 @@ def one_pass(dry=False):
         elif result.get("reason") not in ("nothing waiting",):
             problems[f"wake:{seat}"] = f"{seat.title()} has notes it can't be given: {result.get('reason')}."
     report(problems, state, dry, now)
+    list_unreviewed(state, dry, now)
     if not dry:
         save_state(state)
         (STATE_DIR / "status.json").write_text(json.dumps({
-            "time": now, "woken": woken, "problems": problems,
+            "time": now, "woken": woken, "settled": settled, "problems": problems,
             "seats": {k: {f: v.get(f) for f in ("state", "shown", "waiting")} for k, v in seats.items()},
         }, indent=1))
     return woken, problems
+
+
+def settle_check():
+    """settle() against a fake deck: parses the changes, tolerates an old deck."""
+    global deck
+    real = deck
+    try:
+        deck = lambda *a, **k: (0, 'log line\n{"screen_turns": ["codex"], "changed": [{"seat": "codex", "from": "busy", "to": "idle"}]}')
+        ok = settle(False) == [{"seat": "codex", "from": "busy", "to": "idle"}]
+        deck = lambda *a, **k: (2, "invalid choice: 'settle'")
+        ok = ok and settle(False) == [] and settle(True) == []
+        return ok
+    finally:
+        deck = real
 
 
 def self_test():
@@ -222,8 +350,10 @@ def self_test():
         "i": {**base, "state": "idle", "waiting_normal": 0},
         "lumo": {**base, "kind": "app", "state": "idle", "oldest_waiting_s": 2000},
     }
+    seats["n"] = {**base, "state": "idle", "waiting_normal": 0}          # no hooks
+    seats["m"] = {**base, "state": "away", "waiting_normal": 0}          # no hooks, not running
     LEAVE_ALONE.add("z")
-    wakes, problems = plan(seats)
+    wakes, problems = plan(seats, {"n": False, "m": False, "a": True, "z": False})
     LEAVE_ALONE.discard("z")
     checks = [
         ("stale busy is woken with --stale", ("a", True) in wakes),
@@ -232,6 +362,17 @@ def self_test():
         ("the loop guard is reported, not woken", "paused:d" in problems and not any(s == "d" for s, _ in wakes)),
         ("a truly busy seat is left alone", not any(s == "e" for s, _ in wakes)),
         ("a stuck codex is woken like any seat", ("codex", False) in wakes),
+        ("a running agent with no hooks is reported", "hooks:n" in problems),
+        ("an agent that isn't running isn't nagged about hooks", "hooks:m" not in problems),
+        ("unknown hook files aren't reported", not any(k == "hooks:b" for k in problems)),
+        ("unreviewed PRs: only old, unreviewed, non-draft ones", [n for n, _, _ in unreviewed([
+            {"number": 1, "title": "old", "createdAt": "2026-01-01T00:00:00Z"},
+            {"number": 2, "title": "new", "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+            {"number": 3, "title": "reviewed", "createdAt": "2026-01-01T00:00:00Z", "reviews": [{"state": "APPROVED"}]},
+            {"number": 4, "title": "comment", "createdAt": "2026-01-01T00:00:00Z", "comments": [{"body": "ok\nReviewed by: Devin"}]},
+            {"number": 5, "title": "draft", "createdAt": "2026-01-01T00:00:00Z", "isDraft": True},
+        ], time.time())] == [1]),
+        ("settle reads the deck's answer and skips an old deck", settle_check()),
         ("a LEAVE_ALONE seat is never touched", not any(s == "z" for s, _ in wakes) and not any(":z" in k for k in problems)),
         ("an agent that isn't running is reported", "away:f" in problems),
         ("an app whose sends fail is reported", "sending:g" in problems),
