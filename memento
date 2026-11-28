@@ -152,18 +152,23 @@ def plan():
         if not tree.exists() or not wanted:
             continue
         prs = gh_json(["pr", "list", "--repo", f"{GH_OWNER}/{repo}", "--state", "open", "--limit", "100", "--json",
-                       "number,title,headRefName,baseRefName,mergeable,isDraft,reviews,comments"], str(tree)) or []
+                       "number,title,headRefName,headRefOid,baseRefName,mergeable,isDraft,reviews,comments"], str(tree)) or []
         prs = [p for p in prs if p["number"] in wanted]
         for missing in sorted(wanted - {p["number"] for p in prs}):
             say(f"  note: {repo}#{missing} is queued but not open (merged or closed already?)")
+        held_into_test = []
         for p in order(prs):
             why = []
+            if p["headRefName"] == "test" and p["baseRefName"] == "main" and held_into_test:
+                why.append("waits for " + ", ".join(f"#{n}" for n in held_into_test))
             if p.get("isDraft"):
                 why.append("draft")
             if p.get("mergeable") == "CONFLICTING":
                 why.append("conflicts")
             if not reviewed(p):
                 why.append("not reviewed")
+            if why and p["baseRefName"] == "test":
+                held_into_test.append(p["number"])  # the promotion would ship test without it
             rows.append((repo, p, not why, ", ".join(why)))
     return rows
 
@@ -182,9 +187,10 @@ def rehearse(repo, prs):
         for p in prs:
             if p["headRefName"] == "test" and p["baseRefName"] == "main":
                 continue  # the promotion is what the scratch tree already is
+            # The exact commit the plan saw: what's rehearsed is what's merged.
             run(["git", "fetch", "-q", "origin", f"pull/{p['number']}/head"], cwd=scratch)
             code, out = run(["git", "-c", "user.name=memento", "-c", "user.email=memento@localhost",
-                             "merge", "-q", "--no-edit", "FETCH_HEAD"], cwd=scratch)
+                             "merge", "-q", "--no-edit", p.get("headRefOid") or "FETCH_HEAD"], cwd=scratch)
             if code != 0:
                 return False, f"#{p['number']} doesn't merge on top of the others: {out[:200]}"
         test = SELF_TESTS.get(repo)
@@ -272,7 +278,10 @@ def go():
     for repo, prs in by_repo.items():
         say(f"\n  {repo}:")
         for p in prs:
-            code, out = run(["gh", "pr", "merge", str(p["number"]), "--repo", f"{GH_OWNER}/{repo}", "--merge"],
+            # Pinned to the rehearsed commit (Devin's review): if the PR moved
+            # between the plan and Y's yes, GitHub refuses and we stop.
+            pin = ["--match-head-commit", p["headRefOid"]] if p.get("headRefOid") else []
+            code, out = run(["gh", "pr", "merge", str(p["number"]), "--repo", f"{GH_OWNER}/{repo}", "--merge", *pin],
                             cwd=str(REPOS[repo]))
             say(f"    {'merged' if code == 0 else 'FAILED'} #{p['number']}" + ("" if code == 0 else f": {out[-200:]}"))
             if code == 0:
